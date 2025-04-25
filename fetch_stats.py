@@ -36,7 +36,8 @@ def create_database():
             failed_tasks_count INTEGER,
             passed_tasks_count INTEGER,
             runtime DOUBLE,
-            fetch_date TIMESTAMP
+            fetch_date TIMESTAMP,
+            state VARCHAR
         )
     ''')
     
@@ -157,6 +158,8 @@ def insert_jobs_into_db(jobs_data):
         total_tasks_count = status_info.get('total')
         failed_tasks_count = status_info.get('failed')
         passed_tasks_count = status_info.get('passed')
+
+        state = job.get('state')
         
         # Check if job already exists
         existing = conn.execute(f"SELECT uid FROM jobs WHERE uid = ?", [uid]).fetchone()
@@ -167,13 +170,13 @@ def insert_jobs_into_db(jobs_data):
                 INSERT INTO jobs (
                     uid, commit_sha, commit_message, commit_author,
                     creation_time, start_time, total_tasks_count, 
-                    failed_tasks_count, passed_tasks_count, runtime, fetch_date
+                    failed_tasks_count, passed_tasks_count, runtime, fetch_date, state
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', [
                 uid, commit_sha, commit_message, commit_author,
                 datetime.fromtimestamp(creation_time), datetime.fromtimestamp(start_time),
                 total_tasks_count, failed_tasks_count, passed_tasks_count, runtime,
-                current_time
+                current_time, state
             ])
             inserted.append(uid)
     
@@ -260,7 +263,7 @@ def main():
             logger.info(f"Inserted {inserted} worker statistics for job {uid}")
         
         # Add a delay between requests to avoid overloading the server
-        time.sleep(0.2)  # 500ms delay between requests
+        time.sleep(.2)  # 200ms delay between requests
     
     logger.info(f"Total worker statistics inserted: {stats_count}")
 
