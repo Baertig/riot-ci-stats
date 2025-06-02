@@ -9,6 +9,11 @@ import logging
 from datetime import datetime
 import time
 
+DB_FILE = "riot_ci_stats.duckdb"
+
+CI_RIOT_URL = "https://ci.riot-os.org"
+CI_STAGING_RIOT_URL = "https://ci-staging.riot-os.org"
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -17,9 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('riot_ci_stats')
 
-# Database configuration
-DB_FILE = "riot_ci_stats.duckdb"
-CI_RIOT_URL = "https://ci.riot-os.org"
 
 def create_database():
     """Create the database and schema if they don't exist"""
@@ -37,7 +39,8 @@ def create_database():
             passed_tasks_count INTEGER,
             runtime DOUBLE,
             fetch_date TIMESTAMP,
-            state VARCHAR
+            state VARCHAR,
+            url VARCHAR
         )
     ''')
     
@@ -64,14 +67,16 @@ def create_database():
     conn.close()
     logger.info(f"Database initialized at {DB_FILE}")
 
-def get_latest_job_date():
+
+def get_latest_job_date(url):
     """Get the latest job creation date from the database"""
     if not os.path.exists(DB_FILE):
         logger.info("Database does not exist yet, no latest date available")
         return None
     
     conn = duckdb.connect(DB_FILE)
-    result = conn.execute("SELECT MAX(creation_time) FROM jobs").fetchone()
+    result = conn.execute(
+        "SELECT MAX(creation_time) FROM jobs WHERE url = ?", [url]).fetchone()
     conn.close()
     
     # Check if result is None or if the first element is None
@@ -92,9 +97,10 @@ def remove_none_values(d):
             result[key] = value
     return result
 
-def fetch_jobs_data(limit = 25, status = [], after = None):
+
+def fetch_jobs_data(limit=25, status=[], after=None, url=CI_RIOT_URL):
     """Fetch jobs data from the RIOT-OS CI server"""
-    logger.info(f"Fetching job data from {CI_RIOT_URL}/jobs")
+    logger.info(f"Fetching job data from {url}/jobs")
 
     params = {
         "limit": limit,
@@ -106,19 +112,24 @@ def fetch_jobs_data(limit = 25, status = [], after = None):
     logger.info(f"with params: {params}")
     
     try:
-        response = requests.get(CI_RIOT_URL + "/jobs", params=params)
+        response = requests.get(url + "/jobs", params=params)
         response.raise_for_status()
-        return response.json()
+        jobs = response.json()
+        # attach base URL to each job entry
+        for job in jobs:
+            job['url'] = url
+        return jobs
 
     except requests.RequestException as e:
         logger.error(f"Error fetching data: {e}")
         sys.exit(1)
 
-def fetch_worker_stats(job_uid):
+
+def fetch_worker_stats(job_uid, url=CI_RIOT_URL):
     """Fetch worker statistics for a specific job from the RIOT-OS CI server"""
-    stats_url = f"{CI_RIOT_URL}/results/{job_uid}/stats.json"
+    stats_url = f"{url}/results/{job_uid}/stats.json"
     logger.info(f"Fetching worker statistics from {stats_url}")
-    
+
     try:
         response = requests.get(stats_url)
         response.raise_for_status()
@@ -160,6 +171,7 @@ def insert_jobs_into_db(jobs_data):
         passed_tasks_count = status_info.get('passed')
 
         state = job.get('state')
+        url = job.get('url')
         
         # Check if job already exists
         existing = conn.execute(f"SELECT uid FROM jobs WHERE uid = ?", [uid]).fetchone()
@@ -170,13 +182,13 @@ def insert_jobs_into_db(jobs_data):
                 INSERT INTO jobs (
                     uid, commit_sha, commit_message, commit_author,
                     creation_time, start_time, total_tasks_count, 
-                    failed_tasks_count, passed_tasks_count, runtime, fetch_date, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failed_tasks_count, passed_tasks_count, runtime, fetch_date, state, url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', [
                 uid, commit_sha, commit_message, commit_author,
                 datetime.fromtimestamp(creation_time), datetime.fromtimestamp(start_time),
                 total_tasks_count, failed_tasks_count, passed_tasks_count, runtime,
-                current_time, state
+                current_time, state, url
             ])
             inserted.append(uid)
     
@@ -226,36 +238,55 @@ def main():
         create_database()
     
     # Get the latest job date from the database
-    latest_date = get_latest_job_date()
+    latest_date_prod = get_latest_job_date(CI_RIOT_URL)
+    latest_date_staging = get_latest_job_date(CI_STAGING_RIOT_URL)
     
     # Fetch jobs after the latest date in the database
-    jobs_data = fetch_jobs_data(limit=50, status=["passed", "errored"], after=latest_date)
-    
+    jobs_data_prod = fetch_jobs_data(
+        limit=50, status=["passed", "errored"], after=latest_date_prod, url=CI_RIOT_URL)
+    jobs_data_staging = fetch_jobs_data(limit=50, status=[
+                                        "passed", "errored"], after=latest_date_staging, url=CI_STAGING_RIOT_URL)
+
+    if not jobs_data_prod:
+        logger.warning("No job data retrieved from prod")
+
+    if not jobs_data_staging:
+        logger.warning("No job data retrieved from staging exiting")
+
+    jobs_data = jobs_data_prod + jobs_data_staging
+
     if not jobs_data:
-        logger.warning("No job data retrieved.")
         return
     
     # Insert jobs into database
     inserted_jobs_uid = insert_jobs_into_db(jobs_data)
     logger.info(f"Database updated: {len(inserted_jobs_uid)} new jobs inserted")
-    
+
     # Fetch and insert worker statistics for each job
     stats_count = 0
+
+    conn = duckdb.connect(DB_FILE)
     for uid in inserted_jobs_uid:
         # Check if worker stats already exist for this job
-        conn = duckdb.connect(DB_FILE)
         existing_stats = conn.execute(
             "SELECT COUNT(*) FROM worker_stats WHERE job_uid = ?", 
             [uid]
         ).fetchone()[0]
-        conn.close()
         
         if existing_stats > 0:
             logger.info(f"Worker stats already exist for job {uid}, skipping")
             continue
         
         # Fetch worker stats for this job
-        stats_data = fetch_worker_stats(uid)
+        # pass along the job's base URL when fetching stats
+        job_url = next((j.get('url')
+                       for j in jobs_data if j.get('uid') == uid))
+        if not job_url:
+            logger.warning(
+                f"Did not find url for job with uid {uid}. Skipping")
+            continue
+
+        stats_data = fetch_worker_stats(uid, job_url)
         
         if stats_data:
             inserted = insert_worker_stats_into_db(uid, stats_data)
@@ -265,6 +296,7 @@ def main():
         # Add a delay between requests to avoid overloading the server
         time.sleep(.2)  # 200ms delay between requests
     
+    conn.close()
     logger.info(f"Total worker statistics inserted: {stats_count}")
 
 if __name__ == "__main__":
