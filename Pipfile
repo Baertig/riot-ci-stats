@@ -6,6 +6,9 @@ name = "pypi"
 [packages]
 duckdb = "*"
 requests = "*"
+notebook = "*"
+altair = "*"
+pandas = "*"
 
 [dev-packages]
 
