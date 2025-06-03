@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
+import urllib.parse
 import requests
-import json
 import duckdb
 import os
 import sys
@@ -109,10 +109,17 @@ def fetch_jobs_data(limit=25, status=[], after=None, url=CI_RIOT_URL):
     }
 
     params = remove_none_values(params)
+    # I want spaces url encoded -> %20 and not encoded via +
+    # otherwise the murdock api will ignore the filter
+    params = urllib.parse.urlencode(
+        remove_none_values(params), quote_via=urllib.parse.quote)
     logger.info(f"with params: {params}")
-    
+
     try:
         response = requests.get(url + "/jobs", params=params)
+
+        logger.info(f"send GET {response.url} request")
+
         response.raise_for_status()
         jobs = response.json()
         # attach base URL to each job entry
