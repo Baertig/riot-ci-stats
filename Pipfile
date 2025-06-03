@@ -9,6 +9,7 @@ requests = "*"
 notebook = "*"
 altair = "*"
 pandas = "*"
+ipython = "*"
 
 [dev-packages]
 
