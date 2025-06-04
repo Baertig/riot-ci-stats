@@ -10,6 +10,8 @@ notebook = "*"
 altair = "*"
 pandas = "*"
 ipython = "*"
+polars = "*"
+pyarrow = "*"
 
 [dev-packages]
 
