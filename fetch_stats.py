@@ -8,6 +8,9 @@ import sys
 import logging
 from datetime import datetime, timedelta
 import time
+import gzip
+import io
+import json
 
 DB_FILE = "riot_ci_stats.duckdb"
 
@@ -60,6 +63,19 @@ def create_database():
             total_cpu_time_s DOUBLE,
             fetch_date TIMESTAMP,
             FOREIGN KEY (job_uid) REFERENCES jobs(uid)
+        )
+    ''')
+    # create tasks_stats table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS tasks_stats (
+            job_uid VARCHAR,
+            worker_name VARCHAR,
+            command VARCHAR,
+            application VARCHAR,
+            board VARCHAR,
+            toolchain VARCHAR,
+            runtime_s DOUBLE,
+            created_at TIMESTAMP
         )
     ''')
 
@@ -243,6 +259,72 @@ def insert_worker_stats_into_db(job_uid, stats_data):
     return inserted
 
 
+# fetch and insert task statistics functions
+
+def fetch_task_stats(job_uid, url=CI_RIOT_URL):
+    """Fetch task statistics for a specific job from the RIOT-OS CI server"""
+    stats_url = f"{url}/results/{job_uid}/result.json.gz"
+    logger.info(f"Fetching task statistics from {stats_url}")
+    try:
+        response = requests.get(stats_url)
+        response.raise_for_status()
+        buf = io.BytesIO(response.content)
+        with gzip.GzipFile(fileobj=buf) as f:
+            tasks = json.loads(f.read().decode())
+        return tasks
+    except requests.RequestException as e:
+        logger.warning(f"Error fetching task stats for job {job_uid}: {e}")
+    except (gzip.BadGzipFile, json.JSONDecodeError) as e:
+        logger.warning(f"Error parsing task stats for job {job_uid}: {e}")
+    return None
+
+
+def insert_task_stats_into_db(job_uid, tasks_data):
+    """Insert task statistics into the database"""
+    created_at = datetime.now()
+
+    if not tasks_data or len(tasks_data) == 0:
+        logger.warning(f"No task statistics found for job {job_uid}")
+        return 0
+
+    conn = duckdb.connect(DB_FILE)
+
+    inserted = 0
+
+    for task in tasks_data:
+        worker_name = task.get('result', {}).get('worker')
+        body = task.get('result', {}).get('body', {})
+        command = body.get('command')
+
+        application = None
+        board = None
+        toolchain = None
+        if command:
+            parts = command.split()
+            if len(parts) >= 3:
+                application = parts[2]
+
+            if len(parts) >= 4:
+                board_tool = parts[3].split(':')
+                board = board_tool[0]
+
+                if len(board_tool) > 1:
+                    toolchain = board_tool[1]
+
+        runtime = task.get('result', {}).get('runtime')
+
+        conn.execute('''
+            INSERT INTO tasks_stats (
+                job_uid, worker_name, command, application, board, toolchain, runtime_s, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', [job_uid, worker_name, command, application, board, toolchain, runtime, created_at])
+
+        inserted += 1
+
+    conn.close()
+    return inserted
+
+
 def to_end_of_previous_day(date):
 
     previous_day = date - timedelta(days=1)
@@ -295,6 +377,7 @@ def main():
 
     # Fetch and insert worker statistics for each job
     stats_count = 0
+    tasks_count = 0
 
     conn = duckdb.connect(DB_FILE)
     for uid in inserted_jobs_uid:
@@ -324,11 +407,22 @@ def main():
             stats_count += inserted
             logger.info(f"Inserted {inserted} worker statistics for job {uid}")
 
+        # Fetch and insert task statistics
+        if job_url == CI_STAGING_RIOT_URL:
+            task_stats = fetch_task_stats(uid, job_url)
+
+            if task_stats:
+                inserted_tasks = insert_task_stats_into_db(uid, task_stats)
+                tasks_count += inserted_tasks
+                logger.info(
+                    f"Inserted {inserted_tasks} task statistics for job {uid}")
+
         # Add a delay between requests to avoid overloading the server
         time.sleep(.2)  # 200ms delay between requests
 
     conn.close()
     logger.info(f"Total worker statistics inserted: {stats_count}")
+    logger.info(f"Total task statistics inserted: {tasks_count}")
 
 
 if __name__ == "__main__":
