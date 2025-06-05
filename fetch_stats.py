@@ -75,7 +75,8 @@ def create_database():
             board VARCHAR,
             toolchain VARCHAR,
             runtime_s DOUBLE,
-            created_at TIMESTAMP
+            created_at TIMESTAMP,
+            state VARCHAR
         )
     ''')
 
@@ -295,6 +296,7 @@ def insert_task_stats_into_db(job_uid, tasks_data):
         worker_name = task.get('result', {}).get('worker')
         body = task.get('result', {}).get('body', {})
         command = body.get('command')
+        state = body.get('state')
 
         application = None
         board = None
@@ -315,9 +317,9 @@ def insert_task_stats_into_db(job_uid, tasks_data):
 
         conn.execute('''
             INSERT INTO tasks_stats (
-                job_uid, worker_name, command, application, board, toolchain, runtime_s, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', [job_uid, worker_name, command, application, board, toolchain, runtime, created_at])
+                job_uid, worker_name, command, application, board, toolchain, runtime_s, created_at, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', [job_uid, worker_name, command, application, board, toolchain, runtime, created_at, state])
 
         inserted += 1
 
