@@ -1,0 +1,12 @@
+services:
+  crawler:
+    build:
+      context: ..
+      dockerfile: crawler/Dockerfile
+
+    volumes:
+      - .:/data
+
+    command: ["python", "fetch_stats.py", "-f", "/data/riot-ci-stats.duckdb"]
+    
+      

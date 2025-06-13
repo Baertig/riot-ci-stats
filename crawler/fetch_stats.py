@@ -11,8 +11,7 @@ import time
 import gzip
 import io
 import json
-
-DB_FILE = "riot_ci_stats.duckdb"
+import argparse
 
 CI_RIOT_URL = "https://ci.riot-os.org"
 CI_STAGING_RIOT_URL = "https://ci-staging.riot-os.org"
@@ -26,9 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger('riot_ci_stats')
 
 
-def create_database():
+def create_database(db_file):
     """Create the database and schema if they don't exist"""
-    conn = duckdb.connect(DB_FILE)
+    assert db_file, "database file path must be provided"
+    conn = duckdb.connect(db_file)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS jobs (
             uid VARCHAR PRIMARY KEY,
@@ -81,16 +81,17 @@ def create_database():
     ''')
 
     conn.close()
-    logger.info(f"Database initialized at {DB_FILE}")
+    logger.info(f"Database initialized at {db_file}")
 
 
-def get_latest_job_date(url):
+def get_latest_job_date(url, db_file):
     """Get the latest job creation date from the database"""
-    if not os.path.exists(DB_FILE):
+    assert db_file, "database file path must be provided"
+    if not os.path.exists(db_file):
         logger.info("Database does not exist yet, no latest date available")
         return None
 
-    conn = duckdb.connect(DB_FILE)
+    conn = duckdb.connect(db_file)
     result = conn.execute(
         "SELECT MAX(creation_time) FROM jobs WHERE url = ?", [url]).fetchone()
     conn.close()
@@ -164,9 +165,9 @@ def fetch_worker_stats(job_uid, url=CI_RIOT_URL):
         return None
 
 
-def insert_jobs_into_db(jobs_data):
+def insert_jobs_into_db(jobs_data, db_file):
     """Insert or update jobs in the database"""
-    conn = duckdb.connect(DB_FILE)
+    conn = duckdb.connect(db_file)
 
     inserted = []
 
@@ -223,13 +224,15 @@ def insert_jobs_into_db(jobs_data):
     return inserted
 
 
-def insert_worker_stats_into_db(job_uid, stats_data):
+def insert_worker_stats_into_db(job_uid, stats_data, db_file):
     """Insert worker statistics into the database"""
+    assert db_file, "database file path must be provided"
+
     if not stats_data or 'workers' not in stats_data or len(stats_data.get('workers')) == 0:
         logger.warning(f"No worker statistics found for job {job_uid}")
         return 0
 
-    conn = duckdb.connect(DB_FILE)
+    conn = duckdb.connect(db_file)
     current_time = datetime.now()
     inserted = 0
 
@@ -280,7 +283,7 @@ def fetch_task_stats(job_uid, url=CI_RIOT_URL):
     return None
 
 
-def insert_task_stats_into_db(job_uid, tasks_data):
+def insert_task_stats_into_db(job_uid, tasks_data, db_file):
     """Insert task statistics into the database"""
     created_at = datetime.now()
 
@@ -288,7 +291,7 @@ def insert_task_stats_into_db(job_uid, tasks_data):
         logger.warning(f"No task statistics found for job {job_uid}")
         return 0
 
-    conn = duckdb.connect(DB_FILE)
+    conn = duckdb.connect(db_file)
 
     inserted = 0
 
@@ -341,14 +344,28 @@ def to_end_of_previous_day(date):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch and store CI stats into DuckDB")
+    parser.add_argument('-f', '--database-file', required=True,
+                        help='Path to DuckDB database file')
+    args = parser.parse_args()
+    db_file = args.database_file
+
     # Create database if it doesn't exist
-    if not os.path.exists(DB_FILE):
+    if not os.path.exists(db_file):
         logger.info("Database did not exist ... creating database")
-        create_database()
+        create_database(db_file)
 
     # Get the latest job date from the database
-    latest_date_prod = get_latest_job_date(CI_RIOT_URL)
-    latest_date_staging = get_latest_job_date(CI_STAGING_RIOT_URL)
+    latest_date_prod = get_latest_job_date(CI_RIOT_URL, db_file)
+
+    if not latest_date_prod:
+        latest_date_prod = datetime.now() - timedelta(days=30)
+
+    latest_date_staging = get_latest_job_date(CI_STAGING_RIOT_URL, db_file)
+
+    if not latest_date_staging:
+        latest_date_staging = datetime.now() - timedelta(days=30)
 
     # Can only input date at day resolution to API
     # ... this way we don't miss jobs that executed on the same day, but after the latest job
@@ -373,7 +390,7 @@ def main():
         return
 
     # Insert jobs into database
-    inserted_jobs_uid = insert_jobs_into_db(jobs_data)
+    inserted_jobs_uid = insert_jobs_into_db(jobs_data, db_file)
     logger.info(
         f"Database updated: {len(inserted_jobs_uid)} new jobs inserted")
 
@@ -381,7 +398,7 @@ def main():
     stats_count = 0
     tasks_count = 0
 
-    conn = duckdb.connect(DB_FILE)
+    conn = duckdb.connect(db_file)
     for uid in inserted_jobs_uid:
         # Check if worker stats already exist for this job
         existing_stats = conn.execute(
@@ -405,16 +422,16 @@ def main():
         stats_data = fetch_worker_stats(uid, job_url)
 
         if stats_data:
-            inserted = insert_worker_stats_into_db(uid, stats_data)
+            inserted = insert_worker_stats_into_db(uid, stats_data, db_file)
             stats_count += inserted
             logger.info(f"Inserted {inserted} worker statistics for job {uid}")
 
         # Fetch and insert task statistics
         if job_url == CI_STAGING_RIOT_URL:
             task_stats = fetch_task_stats(uid, job_url)
-
             if task_stats:
-                inserted_tasks = insert_task_stats_into_db(uid, task_stats)
+                inserted_tasks = insert_task_stats_into_db(
+                    uid, task_stats, db_file)
                 tasks_count += inserted_tasks
                 logger.info(
                     f"Inserted {inserted_tasks} task statistics for job {uid}")
