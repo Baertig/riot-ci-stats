@@ -296,7 +296,7 @@ def insert_task_stats_into_db(job_uid, tasks_data):
         worker_name = task.get('result', {}).get('worker')
         body = task.get('result', {}).get('body', {})
         command = body.get('command')
-        state = body.get('state')
+        state = task.get('state')
 
         application = None
         board = None
