@@ -121,7 +121,7 @@ def fetch_jobs_data(limit=25, status=[], after=None, url=CI_RIOT_URL):
 
     params = {
         "limit": limit,
-        "status": " ".join(status) if len(status) > 0 else None,
+        "states": " ".join(status) if len(status) > 0 else None,
         "after": after.strftime("%Y-%m-%d"),
     }
 
