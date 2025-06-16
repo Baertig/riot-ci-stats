@@ -47,11 +47,8 @@ def create_database(db_file):
         )
     ''')
 
-    conn.execute("CREATE SEQUENCE seq_worker_stats START 1;")
-
     conn.execute('''
         CREATE TABLE IF NOT EXISTS worker_stats (
-            id INTEGER PRIMARY KEY default nextval('seq_worker_stats'),
             job_uid VARCHAR,
             name VARCHAR,
             tasks_count INTEGER,
@@ -62,7 +59,8 @@ def create_database(db_file):
             runtime_min_s DOUBLE,
             total_cpu_time_s DOUBLE,
             fetch_date TIMESTAMP,
-            FOREIGN KEY (job_uid) REFERENCES jobs(uid)
+            FOREIGN KEY (job_uid) REFERENCES jobs(uid),
+            PRIMARY KEY (job_uid, name)
         )
     ''')
     # create tasks_stats table
@@ -349,6 +347,7 @@ def main():
     parser.add_argument('-f', '--database-file', required=True,
                         help='Path to DuckDB database file')
     args = parser.parse_args()
+
     db_file = args.database_file
 
     # Create database if it doesn't exist
