@@ -7,6 +7,6 @@ services:
     volumes:
       - .:/data
 
-    command: ["python", "fetch_stats.py", "-f", "/data/riot-ci-stats.duckdb"]
+    command: ["python", "fetch_stats.py", "-f", "/data/ci-stats.duckdb"]
     
       
