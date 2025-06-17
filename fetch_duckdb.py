@@ -107,27 +107,39 @@ def backup_file(local_path, logger):
 
 
 def merge_databases(local_db, remote_db, logger):
+    """Merge only new jobs and related stats from remote to local."""
     conn = duckdb.connect(local_db)
     try:
         conn.execute(f"ATTACH '{remote_db}' AS rem")
         conn.execute("BEGIN")
 
-        for (tbl,) in conn.execute("SHOW TABLES").fetchall():
-            # find PK columns
-            info = conn.execute(f"PRAGMA table_info('{tbl}')").fetchall()
-            pks = [row[1] for row in info if row[5] > 0]
-            if pks:
-                on_clause = " AND ".join(f"l.{c}=r.{c}" for c in pks)
-                dup = conn.execute(
-                    f"SELECT COUNT(*) FROM rem.{tbl} r JOIN main.{tbl} l ON {on_clause}"
-                ).fetchone()[0]
+        # determine latest start_time in local jobs
+        latest_job_date = conn.execute(
+            "SELECT MAX(start_time) FROM jobs").fetchone()[0]
+        if latest_job_date is None:
+            logger.info("No existing jobs found. Importing all jobs.")
+            condition = ""
+            params = []
+        else:
+            logger.info("Importing jobs with start_time > %s", latest_job_date)
+            condition = "WHERE start_time > ?"
+            params = [latest_job_date]
 
-                if dup:
-                    raise RuntimeError(
-                        f"Primary key conflict on table '{tbl}': {dup} duplicates found")
+        # insert jobs
+        conn.execute(
+            f"INSERT INTO jobs SELECT * FROM rem.jobs {condition}", params)
 
-            logger.info("Inserting %s...", tbl)
-            conn.execute(f"INSERT INTO {tbl} SELECT * FROM rem.{tbl}")
+        # insert worker_stats for these jobs
+        conn.execute(
+            f"INSERT INTO worker_stats SELECT * FROM rem.worker_stats WHERE job_uid IN (SELECT uid FROM rem.jobs {condition})", params)
+
+        # insert tasks_stats for these jobs
+        conn.execute(
+            f"INSERT INTO tasks_stats SELECT * FROM rem.tasks_stats WHERE job_uid IN (SELECT uid FROM rem.jobs {condition})", params)
+
+        # insert redis_stats for these jobs
+        conn.execute(
+            f"INSERT INTO redis_stats SELECT * FROM rem.redis_stats WHERE job_uid IN (SELECT uid FROM rem.jobs {condition})", params)
 
         conn.execute("COMMIT")
 
@@ -139,30 +151,6 @@ def merge_databases(local_db, remote_db, logger):
     finally:
         conn.execute("DETACH rem")
         conn.close()
-
-
-def check_date_overlap(conn_local, conn_remote, schema_local, logger):
-    """Abort if any table's fetch_date or created_at columns have overlapping data."""
-
-    for tbl, cols in schema_local.items():
-        date_cols = [c[0]
-                     for c in cols if c[0] in ('fetch_date', 'created_at')]
-
-        for col in date_cols:
-            local_max = conn_local.execute(
-                f"SELECT MAX({col}) FROM {tbl}").fetchone()[0]
-            remote_min = conn_remote.execute(
-                f"SELECT MIN({col}) FROM {tbl}").fetchone()[0]
-
-            if local_max is not None and remote_min is not None and remote_min <= local_max:
-                overlap = conn_remote.execute(
-                    f"SELECT COUNT(*) FROM {tbl} WHERE {col} <= {repr(local_max)}"
-                ).fetchone()[0]
-                logger.error(
-                    "Error: Overlap detected in table '%s' on column '%s': %d overlapping rows (<= %s)",
-                    tbl, col, overlap, local_max)
-
-                sys.exit(1)
 
 
 def main():
@@ -184,8 +172,6 @@ def main():
                 sys.exit(1)
 
             print_basic_info(conn_local, logger)
-
-            check_date_overlap(conn_local, conn_remote, schema_local, logger)
 
         backup_file(args.duckdb_file, logger)
         merge_databases(args.duckdb_file, remote_copy, logger)
