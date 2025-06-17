@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from prometheus_api_client import PrometheusConnect
 import urllib.parse
 import requests
 import duckdb
@@ -15,6 +16,7 @@ import argparse
 
 CI_RIOT_URL = "https://ci.riot-os.org"
 CI_STAGING_RIOT_URL = "https://ci-staging.riot-os.org"
+
 
 # Configure logging
 logging.basicConfig(
@@ -75,6 +77,24 @@ def create_database(db_file):
             runtime_s DOUBLE,
             created_at TIMESTAMP,
             state VARCHAR
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS redis_stats (
+            redis_keyspace_hits_total_rate_1m DOUBLE,
+            redis_keyspace_misses_total_rate_1m DOUBLE,
+            process_network_receive_bytes_total_rate_1m DOUBLE,
+            process_network_transmit_bytes_total_rate_1m DOUBLE,
+            redis_evicted_keys_total_rate_1m DOUBLE,
+            redis_expired_keys_total_rate_1m DOUBLE,
+            redis_cpu_sys_seconds_total_rate_1m DOUBLE,
+            redis_cpu_user_seconds_total_rate_1m DOUBLE,
+            redis_memory_used_bytes_avg_1m DOUBLE,
+            date_time TIMESTAMP,
+            job_uid VARCHAR,
+            FOREIGN KEY (job_uid) REFERENCES jobs(uid),
+            PRIMARY KEY (job_uid, date_time)
         )
     ''')
 
@@ -328,6 +348,112 @@ def insert_task_stats_into_db(job_uid, tasks_data, db_file):
     return inserted
 
 
+def fetch_redis_data_from_prometheus(prometheus_host, job_uid, job_start_ts, job_runtime):
+    """Fetch Redis metrics from Prometheus for the given job interval and return time series"""
+    # Determine time range
+    start_time = datetime.fromtimestamp(job_start_ts)
+    end_time = start_time + timedelta(seconds=job_runtime)
+
+    logger.info(
+        f"Fetching Redis metrics for job {job_uid} ({start_time} to {end_time}) from Prometheus at {prometheus_host} ")
+    try:
+        prom = PrometheusConnect(url=prometheus_host, disable_ssl=True)
+    except Exception as e:
+        logger.error(
+            f"Failed to connect to Prometheus at {prometheus_host}: {e}")
+        return {}
+
+    # Define metric queries
+    metric_queries = {
+        'redis_keyspace_hits_total_rate_1m': 'rate(redis_keyspace_hits_total[1m])',
+        'redis_keyspace_misses_total_rate_1m': 'rate(redis_keyspace_misses_total[1m])',
+        'process_network_receive_bytes_total_rate_1m': 'rate(process_network_receive_bytes_total[1m])',
+        'process_network_transmit_bytes_total_rate_1m': 'rate(process_network_transmit_bytes_total[1m])',
+        'redis_evicted_keys_total_rate_1m': 'rate(redis_evicted_keys_total[1m])',
+        'redis_expired_keys_total_rate_1m': 'rate(redis_expired_keys_total[1m])',
+        'redis_cpu_sys_seconds_total_rate_1m': 'rate(redis_cpu_sys_seconds_total[1m])',
+        'redis_cpu_user_seconds_total_rate_1m': 'rate(redis_cpu_user_seconds_total[1m])',
+        'redis_memory_used_bytes_avg_1m': 'avg_over_time(redis_memory_used_bytes[1m])'
+    }
+
+    results = {"date_time": []}
+    for field, query in metric_queries.items():
+        try:
+            series = prom.custom_query_range(
+                query=query,
+                start_time=start_time,
+                end_time=end_time,
+                step='1m'
+            )
+
+            # take first series if exists
+            if series and 'values' in series[0]:
+                # list of [timestamp, value]
+                values = map(lambda el: el[1], series[0]['values'])
+                results[field] = list(values)
+
+                # take the first non empty list of timestamps
+                # timestamps should be the same for every fetched series
+                # This way we can be sure date_time list exist if at least on
+                # metric was found
+                if len(results["date_time"]) == 0:
+                    timestamps = map(lambda el: el[0], series[0]['values'])
+                    results["date_time"] = list(timestamps)
+            else:
+                logger.warning(f"No series returned for query '{query}'")
+                results[field] = []
+
+        except Exception as e:
+            logger.error(f"Error fetching metric '{field}': {e}")
+            results[field] = []
+
+    return results
+
+
+def insert_redis_metrics_into_db(job_uid, results, db_file):
+    """Insert fetched Redis metrics time series into DuckDB"""
+
+    if not results or len(results["date_time"]) == 0:
+        logger.warning(f"No Redis metrics to insert for job {job_uid}")
+        return 0
+
+    # Determine metric fields and timestamps
+    fields = [key for key in results.keys() if key != 'date_time']
+    timestamps = results.get('date_time')
+
+    rows = []
+    for idx, ts in enumerate(timestamps):
+        dt = datetime.fromtimestamp(ts)
+        values = []
+        for field in fields:
+            series = results.get(field, [])
+            # It could be that some metric are missing
+            # e.g. redis-exporter lost connection to the redis instance
+            val = float(series[idx]) if len(series) > idx else None
+
+            values.append(val)
+
+        # build row: metrics..., date_time, job_uid
+        rows.append(tuple(values + [dt, job_uid]))
+
+    # Prepare insert SQL
+
+    cols = ", ".join(fields + ["date_time", "job_uid"])
+    placeholder_count = len(fields) + 2
+    placeholders = ", ".join("?" for _ in range(placeholder_count))
+
+    sql = f"INSERT INTO redis_stats ({cols}) VALUES ({placeholders})"
+    try:
+        with duckdb.connect(db_file) as conn:
+            conn.executemany(sql, rows)
+        logger.info(f"Inserted {len(rows)} Redis stats rows for job {job_uid}")
+        return len(rows)
+    except Exception as e:
+        logger.error(
+            f"Error inserting Redis stats into database for job {job_uid}: {e}")
+        return 0
+
+
 def to_end_of_previous_day(date):
 
     previous_day = date - timedelta(days=1)
@@ -343,9 +469,14 @@ def to_end_of_previous_day(date):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch and store CI stats into DuckDB")
+        description="Fetch and store CI stats from murdock and redis into DuckDB")
+
     parser.add_argument('-f', '--database-file', required=True,
                         help='Path to DuckDB database file')
+
+    parser.add_argument('-p', '--prometheus-host', required=True,
+                        help='Path to DuckDB database file')
+
     args = parser.parse_args()
 
     db_file = args.database_file
@@ -396,6 +527,7 @@ def main():
     # Fetch and insert worker statistics for each job
     stats_count = 0
     tasks_count = 0
+    redis_stats_count = 0
 
     conn = duckdb.connect(db_file)
     for uid in inserted_jobs_uid:
@@ -411,8 +543,10 @@ def main():
 
         # Fetch worker stats for this job
         # pass along the job's base URL when fetching stats
-        job_url = next((j.get('url')
-                       for j in jobs_data if j.get('uid') == uid))
+        job = next((j for j in jobs_data if j.get('uid') == uid))
+
+        job_url = job.get('url')
+
         if not job_url:
             logger.warning(
                 f"Did not find url for job with uid {uid}. Skipping")
@@ -435,12 +569,29 @@ def main():
                 logger.info(
                     f"Inserted {inserted_tasks} task statistics for job {uid}")
 
+            # fetch redis data from prometheus
+            redis_series = fetch_redis_data_from_prometheus(
+                args.prometheus_host,
+                uid,
+                job.get('start_time'),
+                job.get('runtime')
+            )
+
+            redis_stats_count += insert_redis_metrics_into_db(
+                uid,
+                redis_series,
+                db_file
+            )
+
         # Add a delay between requests to avoid overloading the server
         time.sleep(.2)  # 200ms delay between requests
 
     conn.close()
     logger.info(f"Total worker statistics inserted: {stats_count}")
     logger.info(f"Total task statistics inserted: {tasks_count}")
+    logger.info(f"Total redis statistics inserted: {redis_stats_count}")
+
+
 
 
 if __name__ == "__main__":

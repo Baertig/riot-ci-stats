@@ -12,6 +12,7 @@ pandas = "*"
 ipython = "*"
 polars = "*"
 pyarrow = "*"
+prometheus-api-client = "*"
 
 [dev-packages]
 
