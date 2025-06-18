@@ -7,6 +7,6 @@ services:
     volumes:
       - .:/data
 
-    command: ["python", "fetch_stats.py", "-f", "/data/ci-stats.duckdb", "--prometheus-host", "http://127.0.0.1:9090"]
+    command: ["python", "fetch_stats.py", "-f", "/data/ci-stats.duckdb", "--prometheus-host", "http://172.17.0.1:9090"]
     
       
